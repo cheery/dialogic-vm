@@ -67,6 +67,10 @@ class Printer(object):
             if not isinstance(value, unicode) else value
             for value in values).encode('utf-8')
 
+    def printconstraints(self, values):
+        for cnt in list_constraints(values):
+            print stringify(cnt, self.symtab).encode('utf-8')
+
     def printbounds(self, bounds):
         print stringify_bound(
             bounds[0] + bounds[1], self.symtab).encode('utf-8')
@@ -150,6 +154,25 @@ def stringify_bound(bound, symtab):
             s = u"bind(" + var + u")"
         ss.append(s)
     return u"[" + u", ".join(ss) + u"]"
+
+def list_constraints(values):
+    result = set()
+    variables = set()
+    stack = list(values)
+    while len(stack) > 0:
+        value = stack.pop()
+        if isinstance(value, Compound):
+            stack.extend(value.args)
+            continue
+        if not isinstance(value, Variable):
+            continue
+        if value.polarity == 1:
+            if value not in variables:
+                result.add(join(value.coroutines, 1))
+            variables.add(value)
+        else:
+            result.update(value.coroutines)
+    return result
 
 # Duplication allows the rule database to be invoked (implements contraction).
 def duplicate(value, memo, index):
@@ -282,7 +305,7 @@ def revert(bound):
         if isinstance(event, Freeze):
             event.var.coroutines.pop()
         elif isinstance(event, Unbind):
-            event.var.instance = var
+            event.var.instance = event.value
         elif isinstance(event, Unfreeze):
             event.var.coroutines.append(event.constraint)
         else:
@@ -296,24 +319,35 @@ def temporevert(event, now):
         return Unfreeze(event.var, event.constraint)
     elif isinstance(event, Unbind):
         if now:
-            event.var.instance = var
+            event.var.instance = event.value
         return var
     elif isinstance(event, Unfreeze):
         if now:
             event.var.coroutines.append(event.constraint)
         return Freeze(event.var, event.constraint)
     else:
-        val = event.var.instance
+        val = event.instance
         if now:
-            event.var.instance = event.var
-        return Unbind(event.var, val)
+            event.instance = event
+        return Unbind(event, val)
 
 def solve(goal, bounds, weakenings, choicepoints, program):
     return trampoline(solve_head,
         (goal, bounds, weakenings, None, choicepoints, 0, program))
 
-def solve_next(bounds, choicepoints, program):
-    side, goal, extra, point, weakenings, cont, scope = choicepoints.pop(0)
+def solve_next(bounds, choicepoints, program, last_result):
+    while True:
+        side, goal, extra, point, weakenings, cont, scope = choicepoints.pop(0)
+        if last_result is sdisj and side == 1:
+            continue
+        if last_result is sconj and side == 0:
+            continue
+        # Looks like this is not working.
+        #if last_result is true and side == 1:
+        #    continue
+        #if last_result is false and side == 0:
+        #    continue
+        break
     revert(bounds[0][point[0]:])
     revert(bounds[1][point[1]:])
     bounds[0][point[0]:] = []
@@ -342,8 +376,7 @@ def solve_head(goal, bounds, weakenings, cont, choicepoints, scope, program):
         side = int(goal.atom is pconj)
         a, b = goal.args
         point = (len(bounds[0]), len(bounds[1]))
-        cont = cont, "parallel", side, (
-            b, point, weaken(weakenings, a, side), scope)
+        cont = cont, "parallel", side, (a, b, point, weakenings, scope)
         return solve_head, (a, bounds, weaken(weakenings, b, side),
             cont, choicepoints, scope, program)
         # parallel-cont
@@ -353,7 +386,7 @@ def solve_head(goal, bounds, weakenings, cont, choicepoints, scope, program):
         a, b = goal.args
         point = (len(bounds[0]), len(bounds[1]))
         cont = cont, "choice", side, (b, point, weakenings, scope)
-        return solve_head, (a, s_bounds, weakenings, cont, choicepoints, scope, program)
+        return solve_head, (a, bounds, weakenings, cont, choicepoints, scope, program)
         # choice-cont
     # Scope-increment is used when quantifiers are introduced.
     # It's needed for proper implementation of rule instantiation.
@@ -384,29 +417,31 @@ def solve_cont(result, cont, bounds, choicepoints, program):
         return None, result
     cont, which, side, block = cont
     if which == "parallel":
-        b, point, weakenings, scope = block
+        a, b, point, weakenings, scope = block
         if result is [false, true][side]:
             return solve_head(b, bounds, weakenings, cont, choicepoints, scope, program)
         # Guarded backtracking point.
         ccont = cont, "guard", side, None
-        choicepoints.append((side, b, [], point, weakenings, ccont, scope))
+        choicepoints.append((side, b, [], point, weaken(weakenings, a, side), ccont, scope))
         return solve_cont, (result, cont, bounds, choicepoints, program)
     if which == "guard":
         if result is [false, true][side]:
-            return [sdisj, sconj][side]
+            return None, [sdisj, sconj][side]
         return solve_cont, (result, cont, bounds, choicepoints, program)
     if which == "choice":
         b, point, weakenings, scope = block
         if result is [false, true][side]:
             bound = bounds[side]
             apoint = len(bound)
+            newbound = []
             for i in range(len(bound)-1, point[side]-1, -1):
-                bound.append(temporevert(bound[i], True))
-            return solve_head, (a, bounds, weakenings, cont, choicepoints, scope, program)
+                newbound.append(temporevert(bound[i], True))
+            bound.extend(reversed(newbound))
+            return solve_head, (b, bounds, weakenings, cont, choicepoints, scope, program)
         # A "normal" backtracking point.
         extra = []
         cbound = bounds[side^1]
-        for i in range(point[side^1], bounds[side^1]):
+        for i in range(point[side^1], len(bounds[side^1])):
             extra.append(temporevert(cbound[i], False))
         choicepoints.append((side, b, extra, point, weakenings, cont, scope))
         return solve_cont, (result, cont, bounds, choicepoints, program)
